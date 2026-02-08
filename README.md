@@ -44,20 +44,55 @@ git clone https://github.com/datagutt/node-osmo
 cd node-osmo
 git apply ../dji-osmo-ble-protocol/patches/node-osmo-all-fixes.patch
 pnpm install
-npx tsc
+npx tsc && cp src/cli.mjs dist/cli.mjs
+
+# Install CLI globally
+pnpm link --global
 
 # Scan for your device
-node --input-type=module -e "
-import noble from '@stoprocent/noble';
-noble.on('stateChange', s => { if (s === 'poweredOn') noble.startScanningAsync([], true); });
-noble.on('discover', p => {
-  if (p.advertisement?.localName?.includes('Osmo'))
-    console.log(p.advertisement.localName, p.id);
-});
-"
+dji-osmo scan
 
-# Connect and stream
-node examples/connect-to-device.js <device-id> 3 <wifi-ssid> <wifi-pass> 'rtmp://your-server/live/key'
+# Get device info (battery, telemetry)
+dji-osmo info <device-id>
+
+# Start RTMP livestream
+dji-osmo stream <device-id> --ssid MyWiFi --password secret --rtmp rtmp://server/live/key
+```
+
+## CLI
+
+The `dji-osmo` CLI provides four commands:
+
+```
+dji-osmo scan                   Scan for nearby DJI Osmo devices
+dji-osmo stream <id> [opts]     Start RTMP livestreaming
+dji-osmo pair <id>              Pair with a device
+dji-osmo info <id>              Show device telemetry (battery %, IMU, etc.)
+```
+
+### Example Session
+
+```
+$ dji-osmo scan
+ℹ Scanning for DJI Osmo devices (10s)...
+
+  OsmoPocket3-7B4B
+    ID:    446005f4812a14933a2a9960c0acf1f4
+    RSSI:  -45 dBm
+
+✓ Found 1 device(s). Use the ID with other commands.
+
+$ dji-osmo info 446005f4812a14933a2a9960c0acf1f4
+  Device Information
+  Name:     OsmoPocket3-7B4B
+  Battery:  32%
+  ...
+
+$ dji-osmo stream 446005f4812a14933a2a9960c0acf1f4 -s Zeo -p mypass -r rtmp://server/live/key
+ℹ Connecting to device...
+ℹ State: discovering → connecting → pairing → streaming
+
+✓ 🎥 STREAMING LIVE → rtmp://server/live/key
 ```
 
 ## The 7 Bugs That Prevented Everything

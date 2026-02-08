@@ -1,3 +1,350 @@
+From 9fd26083b1ebb353806271197c0db5fb7fc43d79 Mon Sep 17 00:00:00 2001
+From: Lars Kappert <9989650+yigitkonur@users.noreply.github.com>
+Date: Sun, 8 Feb 2026 05:15:42 -0800
+Subject: [PATCH] Add dji-osmo CLI + fix 7 BLE protocol bugs for Osmo Pocket 3
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+CLI Commands:
+- dji-osmo scan          — Discover nearby DJI Osmo devices
+- dji-osmo stream        — Full BLE→WiFi→RTMP livestreaming
+- dji-osmo pair          — Pair with device without streaming
+- dji-osmo info          — Show device telemetry (battery, IMU, etc.)
+
+Bug Fixes:
+1. ByteBuf #byteOffset initialized to pool offset instead of 0
+2. ByteBuf.from() missing byteLength in DataView constructor
+3. ByteBuf getUint24() raw array access without pool offset
+4. Message ID byte order: LE→BE (matching wire format)
+5. DUML writes to fff3→fff5 (writeWithoutResponse) ⭐
+6. writeMessage() not async — fire-and-forget BLE writes
+7. manufacturerData guard blocks Osmo Pocket 3 discovery
+
+Additional:
+- PROTOCOL.md with complete DUML-over-BLE specification
+- --verbose flag for debug output
+- Battery percentage decoding in info command
+- Clean error handling and colored output
+- Installable as global CLI via pnpm link
+---
+ PROTOCOL.md                   | 300 ++++++++++++++++++++
+ examples/connect-to-device.js |   2 +-
+ package.json                  |   5 +-
+ src/bytebuf.ts                |  21 +-
+ src/cli.mjs                   | 515 ++++++++++++++++++++++++++++++++++
+ src/device.ts                 | 461 +++++++++++++++++++++---------
+ src/message.ts                |  15 +-
+ 7 files changed, 1158 insertions(+), 161 deletions(-)
+ create mode 100644 PROTOCOL.md
+ create mode 100644 src/cli.mjs
+
+diff --git a/PROTOCOL.md b/PROTOCOL.md
+new file mode 100644
+index 0000000..71a34aa
+--- /dev/null
++++ b/PROTOCOL.md
+@@ -0,0 +1,300 @@
++# DJI Osmo BLE Protocol Reference
++
++> **Verified on**: DJI Osmo Pocket 3 (model 3), firmware via BLE from macOS using `@stoprocent/noble`
++> **Last updated**: February 2026
++
++## Summary of Critical Findings
++
++This document describes the DUML-over-BLE protocol used by DJI Osmo cameras, discovered through reverse engineering the DJI Mimo app's BLE traffic (via [xaionaro/reverse-engineering-dji](https://github.com/xaionaro/reverse-engineering-dji)) and extensive trial-and-error debugging.
++
++### Key Breakthroughs
++
++1. **BLE Write Characteristic**: DUML commands must be written to **fff5** (`writeWithoutResponse`), NOT fff3. This was the single most critical discovery — writing to fff3 causes the device to silently ignore all commands.
++2. **ByteBuf Node.js Buffer Pool Bug**: Node.js Buffers share a pooled 8KB ArrayBuffer. Three separate bugs in `ByteBuf` caused all DUML message parsing to fail.
++3. **Message ID Byte Order**: Message IDs are Big Endian on the wire, not Little Endian.
++4. **manufacturerData Not Required**: The Osmo Pocket 3 does not include `manufacturerData` in its BLE advertisement — the discovery filter must not require it.
++
++---
++
++## BLE Characteristic Map
++
++| UUID | Name | Properties | Purpose |
++|------|------|-----------|---------|
++| **fff3** | — | read, write, notify, indicate | Unknown/unused for DUML (do NOT write DUML here) |
++| **fff4** | PairingRequestor | read, write, notify, indicate | Write `[0x01, 0x00]` to trigger pairing; receives DUML notifications |
++| **fff5** | Sender | read, writeWithoutResponse, notify, indicate | **Write DUML commands here** (writeWithoutResponse); also receives notifications |
++
++> **CRITICAL**: On the Osmo Pocket 3, ALL DUML telemetry and response messages arrive on **fff4** notifications. fff5 receives no notification data despite being subscribed. This may differ on other DJI devices.
++
++---
++
++## DUML Message Wire Format
++
++```
++[0x55] [len_lo] [ver<<2 | len_hi] [crc8] [target:2B LE] [id:2B BE] [type:3B] [payload:N] [crc16:2B LE]
++```
++
++| Field | Bytes | Encoding | Description |
++|-------|-------|----------|-------------|
++| Magic | 1 | — | Always `0x55` |
++| Length | 2 | 10-bit LE | `byte[1] | ((byte[2] & 0x03) << 8)`. Total message length including CRC16 = 13 + payload_length |
++| Version | — | `byte[2] >> 2` | Typically `1` (raw byte = `0x04` when length < 256) |
++| CRC8 | 1 | — | CRC8 of bytes [0..2]. Poly=0x31, Init=0xEE, RefIn=true, RefOut=true |
++| Target | 2 | Little Endian | `sender | (receiver << 8)`. E.g., App(0x02)→WiFi(0x07) = 0x0702 → wire `02 07` |
++| Message ID | 2 | **Big Endian** | Sequence counter. Device echoes same ID in response |
++| Type | 3 | Wire order: `[flags, cmdSet, cmdId]` | flags=byte[8], cmdSet=byte[9], cmdId=byte[10] |
++| Payload | N | — | Command-specific data |
++| CRC16 | 2 | Little Endian | CRC16 of bytes [0..end-2]. Poly=0x1021, Init=0x496C, RefIn=true, RefOut=true |
++
++### Type Field Encoding
++
++The 3-byte type field is read as a 24-bit LE integer in code, but stored on the wire as `[flags, cmdSet, cmdId]`:
++
++| Constant (LE uint24) | Wire bytes | Flags | CmdSet | CmdId |
++|----------------------|-----------|-------|--------|-------|
++| 0x450740 | `40 07 45` | 0x40 (request) | 0x07 | 0x45 |
++| 0xC00745 | `C0 07 45` | 0xC0 (response) | 0x07 | 0x45 |
++
++- **Flags 0x40**: Request/command from app
++- **Flags 0xC0**: Response from device (or acknowledgment from app)
++- **Flags 0x00**: Unsolicited telemetry/notification
++
++### Response Matching
++
++Responses have the same `cmdSet` and `cmdId` as the request, with the response flag (0x80) set:
++- Request flags=0x40 → Response flags=0xC0
++
++---
++
++## Complete Pairing + Streaming Flow (Verified)
++
++### Step 1: BLE Discovery & Connection
++```
++1. Scan for BLE device (localName contains "Osmo")
++2. Connect to peripheral
++3. Discover services → find service fff0
++4. Discover characteristics fff3, fff4, fff5
++5. Subscribe to fff5 notifications (data channel)
++6. Subscribe to fff4 notifications (pairing + telemetry)
++7. Wait for first DUML message on fff4 (device is ready)
++```
++
++### Step 2: Pairing
++```
++1. Write [0x01, 0x00] to fff4 (triggers pairing mode on device)
++2. Wait 200ms
++3. Send SetPairingPIN via DUML on fff5:
++   - Type: 0x450740 (flags=0x40, cmdSet=0x07, cmdId=0x45)
++   - Target: 0x0702 (App → WiFi subsystem)
++   - Payload: PackString(identifier) + PackString(PIN)
++     - identifier: "001749319286102" (15-char device identifier)
++     - PIN: "5160" (default, or read from device screen)
++4. Receive pairing_status response (0xC00745):
++   - payload[1] == 0x01: Already paired → skip to Step 3
++   - payload[1] == 0x02: Pairing required → wait for approval
++5. Receive pairing_pin_approved (0x400746): payload=0x01
++6. Proceed to streaming setup
++```
++
++### Step 3: Prepare to Livestream (Stage 1)
++```
++Send DUML on fff5:
++- Type: 0xE10240 (flags=0x40, cmdSet=0x02, cmdId=0xE1)
++- Target: 0x0802 (App → Streaming subsystem)
++- Payload: [0x1A]
++Wait for response (0xC002E1): payload=0x00 means OK
++```
++
++### Step 4: Prepare to Livestream (Stage 2)
++```
++Send DUML on fff5:
++- Type: 0x8E0240 (flags=0x40, cmdSet=0x02, cmdId=0x8E)
++- Target: 0x0802
++- Payload: [0x00, 0x01, 0x1C, 0x00]
++Wait for response (0xC0028E)
++```
++
++### Step 5: Connect to WiFi
++```
++Send DUML on fff5:
++- Type: 0x470740 (flags=0x40, cmdSet=0x07, cmdId=0x47)
++- Target: 0x0702
++- Payload: PackString(SSID) + PackString(password)
++Wait for response (0xC00747): payload=0x0000 means connected OK
++```
++
++### Step 6: Configure Livestream
++```
++Send DUML on fff5:
++- Type: 0x780840 (flags=0x40, cmdSet=0x08, cmdId=0x78)
++- Target: 0x0802
++- Payload: [resolution, fps, bitrate config] + PackString(RTMP URL)
++```
++
++### Step 7: Start Livestream
++```
++Send DUML on fff5:
++- Type: 0x8E0240 (flags=0x40, cmdSet=0x02, cmdId=0x8E)
++- Target: 0x0802
++- Payload: [0x01, 0x01, 0x1A, 0x00, 0x01, 0x01]
++```
++
++---
++
++## Verified State Machine
++
++```
++idle(0) → discovering(1) → connecting(2) → waitingForDevice(3) → 
++checkingIfPaired(4) → pairing(5) → preparingStream(6) → 
++preparingStream2(7) → settingUpWifi(8) → configuring(9) → 
++startingStream(10) → streaming(11)
++```
++
++### Verified Log Output (Successful Run)
++```
++State change 0 -> 1    (idle → discovering)
++State change 1 -> 2    (→ connecting)
++State change 2 -> 3    (→ waitingForDevice)
++State change 3 -> 4    (→ checkingIfPaired: sent [0x01,0x00] + SetPairingPIN)
++Pairing response: flags=0xc0 payload=0002   ← "pairing required"
++State change 4 -> 5    (→ pairing)
++Pairing approved notification: payload=01   ← user approved on device
++State change 5 -> 6    (→ preparingStream)
++PrepareToLiveStream Stage1 response: payload=00   ← OK
++State change 6 -> 7    (→ preparingStream2)
++PrepareToLiveStream Stage2 response: payload=0000011c0009030900000000000020
++State change 7 -> 8    (→ settingUpWifi)
++WiFi setup response: payload=0000   ← connected to WiFi
++State change 8 -> 10   (→ startingStream, skipped configuring)
++State change 10 -> 11  (→ streaming ✅)
++```
++
++---
++
++## Message Type Reference
++
++### Control Messages (App → Device)
++
++| Name | Type (LE) | Wire bytes | CmdSet | CmdId | Target | Payload |
++|------|-----------|-----------|--------|-------|--------|---------|
++| SetPairingPIN | 0x450740 | `40 07 45` | 0x07 | 0x45 | 0x0702 | PackString(id) + PackString(pin) |
++| ConnectToWiFi | 0x470740 | `40 07 47` | 0x07 | 0x47 | 0x0702 | PackString(ssid) + PackString(pass) |
++| PrepareToLiveStream | 0xE10240 | `40 02 E1` | 0x02 | 0xE1 | 0x0802 | `[0x1A]` |
++| StartStopStreaming | 0x8E0240 | `40 02 8E` | 0x02 | 0x8E | 0x0802 | varies |
++| ConfigureLiveStream | 0x780840 | `40 08 78` | 0x08 | 0x78 | 0x0802 | config + URL |
++| ScanWiFi | 0xAB0740 | `40 07 AB` | 0x07 | 0xAB | 0x0702 | (empty) |
++
++### Response/Notification Messages (Device → App)
++
++| Name | Type (LE) | CmdSet | CmdId | Flags | Meaning |
++|------|-----------|--------|-------|-------|---------|
++| PairingStatus | 0xC00745 | 0x07 | 0x45 | 0xC0 | payload[1]: 0x01=paired, 0x02=pairing required |
++| PairingPINApproved | 0x400746 | 0x07 | 0x46 | 0x40 | payload=0x01: PIN approved by user |
++| WiFiConnectResult | 0xC00747 | 0x07 | 0x47 | 0xC0 | payload=0x0000: success |
++| PrepareStreamResult | 0xC002E1 | 0x02 | 0xE1 | 0xC0 | payload=0x00: OK |
++| StreamResult | 0xC0028E | 0x02 | 0x8E | 0xC0 | varies |
++
++### Telemetry Messages (Unsolicited)
++
++| Name | Type (LE) | CmdSet | CmdId | Freq | Payload |
++|------|-----------|--------|-------|------|---------|
++| GimbalStatus | 0x050400 | 0x04 | 0x05 | ~20Hz | ~52B gyro/accel floats |
++| Keepalive | 0x270400 | 0x04 | 0x27 | ~10Hz | 5B |
++| CameraStatus | 0x800200 | 0x02 | 0x80 | ~10Hz | ~60B device state |
++| CameraVariant | 0xDC0200 | 0x02 | 0xDC | ~2Hz | ~22B |
++| GimbalAngle | 0x1C0400 | 0x04 | 0x1C | ~2Hz | 1B |
++| GeneralStatus | 0xF10000 | 0x00 | 0xF1 | ~1Hz | 4B |
++| GimbalSync | 0x380400 | 0x04 | 0x38 | ~1Hz | varies |
++| DeviceInfo | 0x810040 | 0x00 | 0x81 | ~1Hz | varies |
++| Battery | 0x020D00 | 0x0D | 0x02 | ~1Hz | varies |
++| DeviceVersion | 0x740040 | 0x00 | 0x74 | rare | varies |
++
++---
++
++## PackString Encoding
++
++Used for string fields (SSID, password, PIN, identifier):
++```
++[1B: string_length] [NB: string_bytes_utf8]
++```
++
++---
++
++## Bugs Fixed in node-osmo
++
++### 1. ByteBuf #byteOffset Initialization (CRITICAL)
++**File**: `src/bytebuf.ts:70`
++**Bug**: `#byteOffset` was initialized to `super.byteOffset` instead of `0`
++**Impact**: ALL reads at wrong positions due to Node.js Buffer pool offset
++**Fix**: Initialize to `0`
++
++### 2. ByteBuf.from() byteLength Propagation (CRITICAL)
++**File**: `src/bytebuf.ts:58-64`
++**Bug**: DataView constructor didn't receive `source.byteLength` for Buffer views
++**Impact**: DataView spanned entire 8KB Node.js Buffer pool instead of actual data
++**Fix**: Pass `source.byteLength` to DataView constructor
++
++### 3. ByteBuf getUint24() Offset (CRITICAL)
++**File**: `src/bytebuf.ts:325-334`
++**Bug**: `getUint24()` used `new Uint8Array(this.buffer)` without adding `super.byteOffset`
++**Impact**: ALL message types decoded incorrectly (type=1794 for everything)
++**Fix**: Add `super.byteOffset` when indexing into raw Uint8Array
++
++### 4. Message ID Byte Order
++**File**: `src/message.ts:55,97`
++**Bug**: Message ID encoded/decoded as Little Endian
++**Fix**: Changed to Big Endian (matching Wireshark captures and djictl)
++
++### 5. Write Characteristic (CRITICAL)
++**File**: `src/device.ts` — `writeValue()`
++**Bug**: DUML messages written to **fff3** characteristic
++**Fix**: Write to **fff5** using `writeWithoutResponse` (matching DJI Mimo app's actual behavior)
++
++### 6. writeMessage Not Awaited
++**File**: `src/device.ts:762`
++**Bug**: `writeMessage()` was not async, didn't await the BLE write
++**Fix**: Made async, all callers now await
++
++### 7. manufacturerData Guard
++**File**: `src/device.ts:235-238`
++**Bug**: `onDiscover()` required `manufacturerData` in BLE advertisement
++**Fix**: Removed guard — Osmo Pocket 3 doesn't include manufacturer data
++
++---
++
++## Tools
++
++### Build & Run
++```bash
++npx tsc                    # Build TypeScript
++node examples/connect-to-device.js <deviceId> <model> <ssid> <password> <rtmpUrl>
++```
++
++### BLE Utilities
++```bash
++# Reset macOS Bluetooth (if device stops advertising)
++blueutil --power 0 && sleep 2 && blueutil --power 1
++
++# Scan for DJI devices
++node --input-type=module -e "
++import noble from '@stoprocent/noble';
++noble.on('stateChange', (s) => { if (s === 'poweredOn') noble.startScanningAsync([], true); });
++noble.on('discover', (p) => {
++  if (p.advertisement?.localName?.includes('Osmo'))
++    console.log(p.advertisement.localName, p.id, 'RSSI:', p.rssi);
++});
++"
++```
++
++### Message Sniffer
++```bash
++npx tsx tools/message-sniffer.ts <device-id> <model>
++```
++
++---
++
++## References
++
++- [xaionaro/reverse-engineering-dji](https://github.com/xaionaro/reverse-engineering-dji) — Wireshark captures and dissector for DJI Mimo BLE protocol
++- Wireshark dissector: `dji-ble-message.c` in above repo — defines message type constants
++- djictl (Go implementation) — reference for pairing flow and message construction
 diff --git a/examples/connect-to-device.js b/examples/connect-to-device.js
 index c15f06d..74c0ab2 100644
 --- a/examples/connect-to-device.js
@@ -12,10 +359,20 @@ index c15f06d..74c0ab2 100644
  const wiFiPassword = process.argv[5];
  const rtmpUrl = process.argv[6];
 diff --git a/package.json b/package.json
-index dd221de..035c540 100644
+index dd221de..6cb6b9f 100644
 --- a/package.json
 +++ b/package.json
-@@ -50,7 +50,7 @@
+@@ -9,6 +9,9 @@
+   "engines": {
+     "node": ">= 20.9"
+   },
++  "bin": {
++    "dji-osmo": "./dist/cli.mjs"
++  },
+   "files": [
+     "dist",
+     "README.md"
+@@ -50,7 +53,7 @@
      "tslib": "~2.6.3"
    },
    "volta": {
@@ -70,8 +427,529 @@ index ef59ad3..d57c987 100644
  
      return b0 | b1 | b2;
    }
+diff --git a/src/cli.mjs b/src/cli.mjs
+new file mode 100644
+index 0000000..f7c6baa
+--- /dev/null
++++ b/src/cli.mjs
+@@ -0,0 +1,515 @@
++#!/usr/bin/env node
++
++/**
++ * DJI Osmo CLI — Control DJI Osmo cameras via BLE from the command line.
++ *
++ * Commands:
++ *   scan              Scan for nearby DJI Osmo devices
++ *   stream            Start RTMP livestreaming
++ *   pair              Pair with a device (without streaming)
++ *   info              Connect and show device telemetry
++ */
++
++import noble from '@stoprocent/noble/with-custom-binding.js';
++import {
++  DjiDevice,
++  djiDeviceBitrates,
++  DjiDeviceImageStabilization,
++  DjiDeviceModel,
++  DjiDeviceResolution,
++} from '../dist/index.js';
++
++// Suppress library debug logs by default (re-enable with --verbose)
++const origDebug = console.debug;
++const origInfo = console.info;
++let verbose = process.argv.includes('--verbose') || process.argv.includes('-v');
++console.debug = (...args) => { if (verbose) origDebug(...args); };
++// Suppress "dji-device:" and "dji-scanner:" prefixed info logs
++const _origConsoleInfo = console.info;
++console.info = (...args) => {
++  const first = String(args[0] || '');
++  if (!verbose && (first.startsWith('dji-device:') || first.startsWith('dji-scanner:'))) return;
++  _origConsoleInfo(...args);
++};
++// Suppress "Powered on" and "dj-device:" logs from console.log
++const _origConsoleLog = console.log;
++console.log = (...args) => {
++  const first = String(args[0] || '');
++  if (!verbose && (first === 'Powered on' || first.startsWith('dj-device:'))) return;
++  _origConsoleLog(...args);
++};
++
++const HELP = `
++  dji-osmo — Control DJI Osmo cameras via Bluetooth
++
++  Usage:
++    dji-osmo scan [--timeout <seconds>]
++    dji-osmo stream <device-id> --ssid <wifi> --password <pass> --rtmp <url> [options]
++    dji-osmo pair <device-id> [--pin <code>]
++    dji-osmo info <device-id> [--duration <seconds>]
++
++  Commands:
++    scan        Scan for nearby DJI Osmo devices
++    stream      Start RTMP livestreaming via BLE → WiFi → RTMP
++    pair        Pair with a device (without streaming)
++    info        Connect and show live device telemetry
++
++  Stream Options:
++    --ssid, -s          WiFi network name (required)
++    --password, -p      WiFi password (required)
++    --rtmp, -r          RTMP URL (required)
++    --resolution        Video resolution: 480p, 720p, 1080p (default: 1080p)
++    --fps               Frame rate: 25, 30 (default: 30)
++    --bitrate           Bitrate in kbps (default: 6000)
++    --stabilization     Off, RockSteady, RockSteady+, HorizonBalancing, HorizonSteady
++    --pin               Pairing PIN code (default: 5160)
++    --model, -m         Device model: pocket3, action3, action4, action5pro (default: pocket3)
++
++  Scan Options:
++    --timeout, -t       Scan duration in seconds (default: 10)
++
++  Global Options:
++    --verbose, -v       Show detailed BLE debug output
++
++  Info Options:
++    --duration, -d      How long to collect telemetry in seconds (default: 15)
++    --model, -m         Device model (default: pocket3)
++
++  Pair Options:
++    --pin               Pairing PIN code (default: 5160)
++    --model, -m         Device model (default: pocket3)
++
++  Examples:
++    dji-osmo scan
++    dji-osmo stream abc123 -s MyWiFi -p secret --rtmp rtmp://server/live/key
++    dji-osmo pair abc123
++    dji-osmo info abc123
++
++  Environment:
++    Requires macOS with Bluetooth enabled.
++    Install blueutil for BLE reset: brew install blueutil
++`;
++
++// ─── Argument Parser ─────────────────────────────────────────────────
++
++function parseArgs(argv) {
++  const args = argv.slice(2);
++  const command = args[0];
++  const positional = [];
++  const flags = {};
++
++  for (let i = 1; i < args.length; i++) {
++    const arg = args[i];
++    if (arg.startsWith('--')) {
++      const key = arg.slice(2);
++      const next = args[i + 1];
++      if (next && !next.startsWith('-')) {
++        flags[key] = next;
++        i++;
++      } else {
++        flags[key] = true;
++      }
++    } else if (arg.startsWith('-') && arg.length === 2) {
++      const shortMap = { s: 'ssid', p: 'password', r: 'rtmp', t: 'timeout', m: 'model', d: 'duration' };
++      const key = shortMap[arg[1]] || arg[1];
++      const next = args[i + 1];
++      if (next && !next.startsWith('-')) {
++        flags[key] = next;
++        i++;
++      } else {
++        flags[key] = true;
++      }
++    } else {
++      positional.push(arg);
++    }
++  }
++
++  return { command, positional, flags };
++}
++
++function resolveModel(name) {
++  const map = {
++    pocket3: DjiDeviceModel.osmoPocket3,
++    action3: DjiDeviceModel.osmoAction3,
++    action4: DjiDeviceModel.osmoAction4,
++    action5pro: DjiDeviceModel.osmoAction5Pro,
++  };
++  return map[name?.toLowerCase()] ?? DjiDeviceModel.osmoPocket3;
++}
++
++function resolveResolution(name) {
++  const map = { '480p': DjiDeviceResolution.r480p, '720p': DjiDeviceResolution.r720p, '1080p': DjiDeviceResolution.r1080p };
++  return map[name] ?? DjiDeviceResolution.r1080p;
++}
++
++function resolveStabilization(name) {
++  const map = {
++    off: DjiDeviceImageStabilization.Off,
++    rocksteady: DjiDeviceImageStabilization.RockSteady,
++    'rocksteady+': DjiDeviceImageStabilization.RockSteadyPlus,
++    horizonbalancing: DjiDeviceImageStabilization.HorizonBalancing,
++    horizonsteady: DjiDeviceImageStabilization.HorizonSteady,
++  };
++  return map[name?.toLowerCase()] ?? DjiDeviceImageStabilization.RockSteadyPlus;
++}
++
++function die(msg) {
++  console.error(`\x1b[31m✗\x1b[0m ${msg}`);
++  process.exit(1);
++}
++
++function info(msg) {
++  console.log(`\x1b[36mℹ\x1b[0m ${msg}`);
++}
++
++function success(msg) {
++  console.log(`\x1b[32m✓\x1b[0m ${msg}`);
++}
++
++function warn(msg) {
++  console.log(`\x1b[33m⚠\x1b[0m ${msg}`);
++}
++
++// ─── Commands ────────────────────────────────────────────────────────
++
++async function cmdScan(flags) {
++  const timeout = parseInt(flags.timeout || '10') * 1000;
++  const found = new Map();
++
++  info(`Scanning for DJI Osmo devices (${timeout / 1000}s)...`);
++  console.log();
++
++  const n = noble({ extended: false });
++
++  n.on('stateChange', (state) => {
++    if (state === 'poweredOn') {
++      n.startScanningAsync([], true);
++    } else {
++      die(`Bluetooth adapter state: ${state}. Is Bluetooth enabled?`);
++    }
++  });
++
++  n.on('discover', (peripheral) => {
++    const name = peripheral.advertisement?.localName || '';
++    if (!name.includes('Osmo') && !name.includes('DJI') && !name.includes('Pocket') && !name.includes('Action')) return;
++    if (found.has(peripheral.id)) return;
++
++    const mfr = peripheral.advertisement?.manufacturerData;
++    found.set(peripheral.id, true);
++
++    console.log(`  \x1b[1m${name}\x1b[0m`);
++    console.log(`    ID:    ${peripheral.id}`);
++    console.log(`    RSSI:  ${peripheral.rssi} dBm`);
++    if (mfr) console.log(`    Mfr:   ${mfr.toString('hex')}`);
++    console.log();
++  });
++
++  await new Promise((resolve) => setTimeout(resolve, timeout));
++  n.stopScanning();
++
++  if (found.size === 0) {
++    warn('No DJI devices found. Make sure your camera is powered on and nearby.');
++  } else {
++    success(`Found ${found.size} device(s). Use the ID with other commands.`);
++  }
++
++  process.exit(0);
++}
++
++async function cmdStream(positional, flags) {
++  const deviceId = positional[0];
++  if (!deviceId) die('Missing device ID. Run "dji-osmo scan" to find your device.');
++  if (!flags.ssid) die('Missing --ssid. Specify the WiFi network name.');
++  if (!flags.password) die('Missing --password. Specify the WiFi password.');
++  if (!flags.rtmp) die('Missing --rtmp. Specify the RTMP URL.');
++
++  const model = resolveModel(flags.model);
++  const resolution = resolveResolution(flags.resolution);
++  const fps = parseInt(flags.fps || '30');
++  const bitrate = parseInt(flags.bitrate || '6000') * 1000;
++  const stabilization = resolveStabilization(flags.stabilization);
++  const pin = flags.pin || '5160';
++
++  info(`Connecting to device ${deviceId}...`);
++  info(`WiFi: ${flags.ssid} | RTMP: ${flags.rtmp}`);
++  info(`Resolution: ${resolution} | FPS: ${fps} | Bitrate: ${bitrate / 1000}kbps | Stabilization: ${stabilization}`);
++  console.log();
++
++  const device = new DjiDevice(deviceId, model);
++  device.setPairPinCode(pin);
++
++  // Track state changes for user-friendly output
++  const stateNames = {
++    0: 'idle', 1: 'discovering', 2: 'connecting', 3: 'waiting for device',
++    4: 'checking pairing', 5: 'pairing', 6: 'preparing stream (1/2)',
++    7: 'preparing stream (2/2)', 8: 'connecting WiFi', 9: 'configuring',
++    10: 'starting stream', 11: 'streaming', 12: 'stopping',
++  };
++
++  const origSetState = device.setState?.bind(device);
++  let lastState = -1;
++
++  // Monitor state by polling (since setState is private)
++  const stateMonitor = setInterval(() => {
++    const s = device.getState();
++    if (s !== lastState) {
++      lastState = s;
++      const name = stateNames[s] || `unknown(${s})`;
++      if (s === 11) {
++        console.log();
++        success(`🎥 STREAMING LIVE → ${flags.rtmp}`);
++        console.log();
++        info('Press Ctrl+C to stop streaming.');
++      } else {
++        info(`State: ${name}`);
++      }
++    }
++  }, 200);
++
++  // Handle Ctrl+C gracefully
++  process.on('SIGINT', () => {
++    console.log();
++    info('Stopping stream...');
++    device.stopLiveStream();
++    clearInterval(stateMonitor);
++    setTimeout(() => {
++      success('Stream stopped. Goodbye!');
++      process.exit(0);
++    }, 3000);
++  });
++
++  try {
++    await device.startLiveStream(
++      flags.ssid,
++      flags.password,
++      flags.rtmp,
++      resolution,
++      fps,
++      bitrate,
++      stabilization,
++    );
++  } catch (err) {
++    clearInterval(stateMonitor);
++    die(`Stream failed: ${err.message}`);
++  }
++}
++
++async function cmdPair(positional, flags) {
++  const deviceId = positional[0];
++  if (!deviceId) die('Missing device ID. Run "dji-osmo scan" to find your device.');
++
++  const model = resolveModel(flags.model);
++  const pin = flags.pin || '5160';
++
++  info(`Pairing with device ${deviceId} (PIN: ${pin})...`);
++  console.log();
++
++  const device = new DjiDevice(deviceId, model);
++  device.setPairPinCode(pin);
++
++  let paired = false;
++  let shownWaiting = false;
++  const stateMonitor = setInterval(() => {
++    const s = device.getState();
++    if (s === 5 && !shownWaiting) {
++      shownWaiting = true;
++      info('Waiting for pairing approval on device screen...');
++    }
++    if (s >= 4 && !paired) {
++      // State 4 with payload=0001 means already paired (goes to 6 quickly)
++      // State 5 means pairing in progress
++      // State 6+ means pairing succeeded
++      if (s >= 6) {
++        paired = true;
++        success('Device paired successfully!');
++        clearInterval(stateMonitor);
++        // Exit immediately — don't call stopLiveStream with dummy config
++        process.exit(0);
++      }
++    }
++  }, 200);
++
++  // Start the flow but we only care about pairing
++  // Use a dummy RTMP URL — we'll stop before WiFi connects
++  try {
++    await device.startLiveStream(
++      'dummy-ssid',
++      'dummy-pass',
++      'rtmp://localhost/dummy',
++      DjiDeviceResolution.r1080p,
++      30,
++      2000000,
++      DjiDeviceImageStabilization.Off,
++    );
++  } catch {
++    // Expected to fail after pairing since dummy WiFi won't work
++  }
++
++  // Timeout
++  setTimeout(() => {
++    if (!paired) {
++      clearInterval(stateMonitor);
++      die('Pairing timed out. Make sure the camera screen is visible and approve the pairing request.');
++    }
++  }, 60000);
++}
++
++async function cmdInfo(positional, flags) {
++  const deviceId = positional[0];
++  if (!deviceId) die('Missing device ID. Run "dji-osmo scan" to find your device.');
++
++  const model = resolveModel(flags.model);
++  const duration = parseInt(flags.duration || '15') * 1000;
++
++  info(`Connecting to ${deviceId} to collect telemetry (${duration / 1000}s)...`);
++  console.log();
++
++  // Use noble directly for a lightweight connection
++  const n = noble({ extended: false });
++  let peripheral;
++
++  await new Promise((resolve, reject) => {
++    n.on('stateChange', (state) => {
++      if (state === 'poweredOn') n.startScanningAsync([], false);
++      else reject(new Error(`Bluetooth state: ${state}`));
++    });
++    n.on('discover', async (p) => {
++      if (p.id !== deviceId) return;
++      n.stopScanning();
++      peripheral = p;
++      resolve(undefined);
++    });
++    setTimeout(() => reject(new Error('Device not found within 10 seconds')), 10000);
++  });
++
++  const name = peripheral.advertisement?.localName || 'Unknown';
++  success(`Found: ${name} (RSSI: ${peripheral.rssi} dBm)`);
++  console.log();
++
++  await peripheral.connectAsync();
++  success('Connected');
++
++  const { characteristics } = await peripheral.discoverSomeServicesAndCharacteristicsAsync(
++    ['fff0'], ['fff4', 'fff5']
++  );
++
++  const fff4 = characteristics.find(c => c.uuid === 'fff4');
++  const fff5 = characteristics.find(c => c.uuid === 'fff5');
++
++  if (!fff4 || !fff5) die('Required BLE characteristics not found.');
++
++  // Message stats
++  const msgStats = {};
++  let msgCount = 0;
++  let receiveBuffer = Buffer.alloc(0);
++
++  const parseMessages = (data) => {
++    receiveBuffer = Buffer.concat([receiveBuffer, data]);
++    while (receiveBuffer.length >= 4) {
++      if (receiveBuffer[0] !== 0x55) {
++        receiveBuffer = receiveBuffer.subarray(1);
++        continue;
++      }
++      const len = receiveBuffer[1] | ((receiveBuffer[2] & 0x03) << 8);
++      if (len > receiveBuffer.length) break;
++      if (len < 13) { receiveBuffer = receiveBuffer.subarray(1); continue; }
++
++      const msg = receiveBuffer.subarray(0, len);
++      receiveBuffer = receiveBuffer.subarray(len);
++
++      const flags = msg[8];
++      const cmdSet = msg[9];
++      const cmdId = msg[10];
++      const payload = msg.subarray(11, len - 2);
++
++      const key = `0x${cmdSet.toString(16).padStart(2, '0')}:0x${cmdId.toString(16).padStart(2, '0')}`;
++      if (!msgStats[key]) msgStats[key] = { count: 0, cmdSet, cmdId, lastPayload: '', flags };
++      msgStats[key].count++;
++      msgStats[key].lastPayload = payload.toString('hex').slice(0, 40);
++      msgCount++;
++    }
++  };
++
++  await fff5.subscribeAsync();
++  fff5.on('data', parseMessages);
++  await fff4.subscribeAsync();
++  fff4.on('data', parseMessages);
++
++  info(`Collecting telemetry for ${duration / 1000}s...`);
++  console.log();
++
++  await new Promise(resolve => setTimeout(resolve, duration));
++
++  // Display results
++  const battery = Object.entries(msgStats).find(([k]) => k === '0x0d:0x02');
++  let batteryPct = null;
++  if (battery) {
++    const bPayload = Buffer.from(battery[1].lastPayload, 'hex');
++    if (bPayload.length >= 2) batteryPct = bPayload[1];
++  }
++
++  console.log('\x1b[1m  Device Information\x1b[0m');
++  console.log(`  Name:     ${name}`);
++  console.log(`  ID:       ${deviceId}`);
++  console.log(`  RSSI:     ${peripheral.rssi} dBm`);
++  if (batteryPct !== null) console.log(`  Battery:  ${batteryPct}%`);
++  console.log();
++
++  console.log('\x1b[1m  Message Summary\x1b[0m');
++  console.log(`  Total messages received: ${msgCount}`);
++  console.log();
++
++  console.log('  \x1b[4mCmdSet  CmdId   Count   Description\x1b[0m');
++
++  const descriptions = {
++    '0x04:0x05': 'Gimbal/IMU status',
++    '0x04:0x27': 'Keepalive',
++    '0x02:0x80': 'Camera status',
++    '0x02:0xdc': 'Camera variant',
++    '0x04:0x1c': 'Gimbal angle',
++    '0x00:0xf1': 'General status',
++    '0x04:0x38': 'Gimbal sync',
++    '0x00:0x81': 'Device info',
++    '0x0d:0x02': 'Battery',
++    '0x00:0x74': 'Device version',
++    '0x04:0x09': 'Sensor data',
++    '0x02:0x27': 'Recording status',
++  };
++
++  const sorted = Object.entries(msgStats).sort((a, b) => b[1].count - a[1].count);
++  for (const [key, val] of sorted) {
++    const desc = descriptions[key] || '';
++    console.log(`  ${key.split(':')[0].padEnd(8)}${key.split(':')[1].padEnd(8)}${String(val.count).padEnd(8)}${desc}`);
++  }
++  console.log();
++
++  await peripheral.disconnectAsync();
++  success('Disconnected. Goodbye!');
++  process.exit(0);
++}
++
++// ─── Main ────────────────────────────────────────────────────────────
++
++const { command, positional, flags } = parseArgs(process.argv);
++
++if (!command || flags.help || command === 'help' || command === '--help' || command === '-h') {
++  console.log(HELP);
++  process.exit(0);
++}
++
++switch (command) {
++  case 'scan':
++    await cmdScan(flags);
++    break;
++  case 'stream':
++    await cmdStream(positional, flags);
++    break;
++  case 'pair':
++    await cmdPair(positional, flags);
++    break;
++  case 'info':
++    await cmdInfo(positional, flags);
++    break;
++  default:
++    die(`Unknown command: ${command}. Run "dji-osmo --help" for usage.`);
++}
 diff --git a/src/device.ts b/src/device.ts
-index 8a147f3..9d9524e 100644
+index 8a147f3..267eb46 100644
 --- a/src/device.ts
 +++ b/src/device.ts
 @@ -22,9 +22,11 @@ import {
@@ -142,7 +1020,7 @@ index 8a147f3..9d9524e 100644
      this.setState(DjiDeviceState.idle);
    }
  
-@@ -222,10 +234,8 @@ export class DjiDevice {
+@@ -222,15 +234,13 @@ export class DjiDevice {
      if (this.state !== DjiDeviceState.discovering) {
        return;
      }
@@ -155,6 +1033,12 @@ index 8a147f3..9d9524e 100644
      this.noble?.stopScanning();
      this.cameraPeripheral = peripheral;
  
+     if (peripheral.state !== 'connected') {
+-      console.info('dj-device: Try to connect asynchronously');
++      console.info('dji-device: Try to connect asynchronously');
+       await peripheral
+         .connectAsync()
+         .then(() => {
 @@ -250,80 +260,56 @@ export class DjiDevice {
        return;
      }
@@ -810,3 +1694,6 @@ index 11292fd..371ac20 100644
    }
  }
  
+-- 
+2.52.0
+
