@@ -1,0 +1,812 @@
+diff --git a/examples/connect-to-device.js b/examples/connect-to-device.js
+index c15f06d..74c0ab2 100644
+--- a/examples/connect-to-device.js
++++ b/examples/connect-to-device.js
+@@ -16,7 +16,7 @@ if (process.argv.length < 6) {
+ }
+ 
+ const deviceId = process.argv[2];
+-const deviceModel = DjiDeviceModel.osmoAction4; // process.argv[3];
++const deviceModel = DjiDeviceModel.osmoPocket3; // process.argv[3];
+ const wiFiName = process.argv[4];
+ const wiFiPassword = process.argv[5];
+ const rtmpUrl = process.argv[6];
+diff --git a/package.json b/package.json
+index dd221de..035c540 100644
+--- a/package.json
++++ b/package.json
+@@ -50,7 +50,7 @@
+     "tslib": "~2.6.3"
+   },
+   "volta": {
+-    "node": "20.15.1",
++    "node": "18.20.8",
+     "pnpm": "9.5.0"
+   },
+   "packageManager": "pnpm@9.5.0"
+diff --git a/src/bytebuf.ts b/src/bytebuf.ts
+index ef59ad3..d57c987 100644
+--- a/src/bytebuf.ts
++++ b/src/bytebuf.ts
+@@ -55,19 +55,19 @@ class ByteBuf extends DataView {
+       byteOffset = source.byteOffset + (byteOffset || 0);
+     }
+ 
+-    return byteLength === undefined
++    const len = byteLength === undefined
++      ? (ArrayBuffer.isView(source) ? source.byteLength : undefined)
++      : Math.min(source.byteLength, byteLength);
++
++    return len === undefined
+       ? new ByteBuf(buffer, byteOffset)
+-      : new ByteBuf(
+-          buffer,
+-          byteOffset,
+-          Math.min(source.byteLength, byteLength),
+-        );
++      : new ByteBuf(buffer, byteOffset, len);
+   }
+ 
+   /**
+    * The byte offset.
+    */
+-  #byteOffset: number = super.byteOffset;
++  #byteOffset: number = 0;
+ 
+   /**
+    * The byte offset.
+@@ -325,10 +325,11 @@ class ByteBuf extends DataView {
+   getUint24(byteOffset: number, littleEndian?: boolean): number {
+     const buffer = new Uint8Array(this.buffer);
+     const order = littleEndian ? littleEndian24 : bigEndian24;
++    const base = super.byteOffset + byteOffset;
+ 
+-    const b0 = buffer[byteOffset + order[0]];
+-    const b1 = buffer[byteOffset + order[1]] << 0x8;
+-    const b2 = buffer[byteOffset + order[2]] << 0x10;
++    const b0 = buffer[base + order[0]];
++    const b1 = buffer[base + order[1]] << 0x8;
++    const b2 = buffer[base + order[2]] << 0x10;
+ 
+     return b0 | b1 | b2;
+   }
+diff --git a/src/device.ts b/src/device.ts
+index 8a147f3..9d9524e 100644
+--- a/src/device.ts
++++ b/src/device.ts
+@@ -22,9 +22,11 @@ import {
+ const pairTransactionId = 0x8092;
+ const stopStreamingTransactionId = 0xeac8;
+ const preparingToLivestreamTransactionId = 0x8c12;
++const preparingToLivestreamStage2TransactionId = 0x8c13;
+ const setupWifiTransactionId = 0x8c19;
+ const startStreamingTransactionId = 0x8c2c;
+ const configureTransactionId = 0x8c2d;
++const confirmStartStreamingTransactionId = 0x8c2e;
+ 
+ const pairTarget = 0x0702;
+ const stopStreamingTarget = 0x0802;
+@@ -36,6 +38,7 @@ const startStreamingTarget = 0x0802;
+ const pairType = 0x450740;
+ const stopStreamingType = 0x8e0240;
+ const preparingToLivestreamType = 0xe10240;
++const startStopStreamingType = 0x8e0240;
+ const setupWifiType = 0x470740;
+ const configureType = 0x8e0240;
+ const startStreamingType = 0x780840;
+@@ -49,10 +52,11 @@ enum DjiDeviceState {
+   idle,
+   discovering,
+   connecting,
++  waitingForDevice,  // waiting for first DUML message after subscribe
+   checkingIfPaired,
+   pairing,
+-  cleaningUp,
+   preparingStream,
++  preparingStream2,
+   settingUpWifi,
+   configuring,
+   startingStream,
+@@ -72,10 +76,12 @@ export class DjiDevice {
+   private imageStabilization?: DjiDeviceImageStabilization =
+     DjiDeviceImageStabilization.RockSteadyPlus;
+   private deviceId?: string;
+-  private pairPinCode?: string = 'love';
++  private pairPinCode?: string = '5160';
+   private noble?: typeof noble;
+   private cameraPeripheral?: Peripheral;
+   private fff3Characteristic?: Characteristic;
++  private fff4Characteristic?: Characteristic;
++  private fff5Characteristic?: Characteristic;
+   private state: DjiDeviceState = DjiDeviceState.idle;
+   private startStreamingTimer?: NodeJS.Timeout;
+   private stopStreamingTimer?: NodeJS.Timeout;
+@@ -86,6 +92,8 @@ export class DjiDevice {
+     state: DjiDeviceState,
+   ) => void;
+   private batteryPercentage?: number;
++  private receiveBufferFff4: Buffer = Buffer.alloc(0);
++  private receiveBufferFff5: Buffer = Buffer.alloc(0);
+ 
+   constructor(deviceId: string, model: DjiDeviceModel) {
+     this.deviceId = deviceId;
+@@ -141,7 +149,11 @@ export class DjiDevice {
+     }
+     this.cameraPeripheral = undefined;
+     this.fff3Characteristic = undefined;
++    this.fff4Characteristic = undefined;
++    this.fff5Characteristic = undefined;
+     this.batteryPercentage = undefined;
++    this.receiveBufferFff4 = Buffer.alloc(0);
++    this.receiveBufferFff5 = Buffer.alloc(0);
+     this.setState(DjiDeviceState.idle);
+   }
+ 
+@@ -222,10 +234,8 @@ export class DjiDevice {
+     if (this.state !== DjiDeviceState.discovering) {
+       return;
+     }
+-    const manufacturerData = peripheral.advertisement.manufacturerData;
+-    if (!manufacturerData) {
+-      return;
+-    }
++    // Change state immediately to prevent duplicate onDiscover calls from proceeding
++    this.setState(DjiDeviceState.connecting);
+     this.noble?.stopScanning();
+     this.cameraPeripheral = peripheral;
+ 
+@@ -250,80 +260,56 @@ export class DjiDevice {
+       return;
+     }
+ 
+-    peripheral.discoverServices([], this.onDiscoverServices.bind(this));
++    peripheral.discoverServices(
++      [],
++      (err: string, services: Service[]) => {
++        this.onDiscoverServices(err, services);
++      },
++    );
+     this.startStartStreamingTimer();
+-    this.setState(DjiDeviceState.connecting);
+   }
+ 
+-  private onDiscoverServices(error: Error | null, services: Service[]): void {
++  private async onDiscoverServices(
++    error: string | null,
++    services: Service[],
++  ): Promise<void> {
+     if (error) {
+       console.error('dji-device: Service discovery error', error);
+       return;
+     }
+-    services.forEach((service) => {
++    // Only process the DJI-specific service (fff0), skip standard BLE services
++    // Processing multiple services in parallel causes CoreBluetooth crashes on macOS
++    for (const service of services) {
+       console.info(`dji-device: Discovered service ${service.uuid}`);
+-      service.discoverCharacteristics(
+-        [],
+-        this.onDiscoverCharacteristics.bind(this),
+-      );
+-    });
+-  }
+-
+-  private onDiscoverCharacteristics(
+-    error: Error | null,
+-    characteristics: Characteristic[],
+-  ): void {
+-    if (error) {
+-      console.error('dji-device: Characteristic discovery error', error);
+-      return;
+-    }
+-    characteristics.forEach((characteristic) => {
+-      if (!allowedCharacteristics.includes(characteristic.uuid)) {
++      if (service.uuid !== fff0Id) {
+         console.debug(
+-          `dji-device: Ignoring characteristic ${characteristic.uuid}`,
++          `dji-device: Skipping non-DJI service ${service.uuid}`,
+         );
+-        return;
++        continue;
+       }
+-      console.info(
+-        `dji-device: Subscribing to characteristic ${characteristic.uuid}`,
+-      );
+-      if (characteristic.uuid === fff3Id) {
+-        this.fff3Characteristic = characteristic;
++      await this.discoverAndSubscribeCharacteristics(service);
++    }
++
++    // After characteristics are discovered and subscribed, send pairing request
++    // by writing [0x01, 0x00] to fff4 (pairing requestor) — this triggers the device
++    // to enter pairing mode. Then send SetPairingPIN via DUML on fff3.
++    // This matches djictl's flow: SendPairingRequest → SetPairingPIN
++    if (this.fff4Characteristic) {
++      console.info('dji-device: Sending pairing request [0x01,0x00] to fff4');
++      try {
++        await this.fff4Characteristic.writeAsync(
++          Buffer.from([0x01, 0x00]),
++          false,
++        );
++        console.info('dji-device: Pairing request sent, now sending PIN');
++      } catch (err) {
++        console.error('dji-device: Failed to write pairing request to fff4', err);
+       }
+-      characteristic
+-        .subscribeAsync()
+-        .then(async () => {
+-          console.info(
+-            'dji-device: Subscribed to characteristic',
+-            characteristic.uuid,
+-          );
+-          characteristic.on('data', (data) => {
+-            if (error) {
+-              console.error('dji-device: Characteristic read error', error);
+-              return;
+-            }
+-            this.onCharacteristicValueChanged(characteristic, data);
+-          });
+-          await characteristic.notifyAsync(true);
+-          await characteristic.readAsync();
+-        })
+-        .catch((error) => {
+-          if (error) {
+-            console.error('dji-device: Characteristic subscribe error', error);
+-          }
+-        });
+-    });
+-  }
+ 
+-  private onCharacteristicValueChanged(
+-    characteristic: Characteristic,
+-    value: Buffer,
+-  ): void {
+-    if (
+-      this.state === DjiDeviceState.connecting &&
+-      characteristic.uuid === fff4Id
+-    ) {
+-      console.info('dji-device: Attempting to pair');
++      // Small delay to let device process pairing request
++      await new Promise((r) => setTimeout(r, 200));
++
++      // Send SetPairingPIN via DUML on fff3
+       const payload = new DjiPairMessagePayload(this.pairPinCode);
+       const request = new DjiMessage(
+         pairTarget,
+@@ -331,42 +317,187 @@ export class DjiDevice {
+         pairType,
+         payload.encode(),
+       );
+-      this.writeMessage(request);
++      await this.writeMessage(request);
+       this.setState(DjiDeviceState.checkingIfPaired);
+-      return;
++    }
++  }
++
++  private async discoverAndSubscribeCharacteristics(
++    service: Service,
++  ): Promise<void> {
++    return new Promise<void>((resolve, reject) => {
++      service.discoverCharacteristics(
++        [],
++        async (error: string | null, characteristics: Characteristic[]) => {
++          if (error) {
++            console.error(
++              'dji-device: Characteristic discovery error',
++              error,
++            );
++            reject(error);
++            return;
++          }
++          // Serialize characteristic subscription to avoid CoreBluetooth crashes
++          // First pass: store references and subscribe to fff5 (DUML data channel)
++          for (const characteristic of characteristics) {
++            if (!allowedCharacteristics.includes(characteristic.uuid)) {
++              continue;
++            }
++            console.info(
++              `dji-device: Found characteristic ${characteristic.uuid}`,
++            );
++            if (characteristic.uuid === fff3Id) {
++              this.fff3Characteristic = characteristic;
++            }
++            if (characteristic.uuid === fff4Id) {
++              this.fff4Characteristic = characteristic;
++            }
++            if (characteristic.uuid === fff5Id) {
++              this.fff5Characteristic = characteristic;
++            }
++            // Subscribe to fff5 first (data channel) before fff4 (pairing trigger)
++            if (characteristic.uuid === fff5Id) {
++              try {
++                await characteristic.subscribeAsync();
++                console.info(
++                  'dji-device: Subscribed to characteristic',
++                  characteristic.uuid,
++                );
++                characteristic.on('data', (data: Buffer) => {
++                  this.onCharacteristicValueChanged(characteristic, data);
++                });
++                await new Promise((r) => setTimeout(r, 100));
++              } catch (subscribeError) {
++                console.error(
++                  'dji-device: Characteristic subscribe error',
++                  subscribeError,
++                );
++              }
++            }
++          }
++          // Second pass: subscribe to fff4 (pairing trigger) — this must happen
++          // after fff5 is ready so we can receive the pairing response
++          if (this.fff4Characteristic) {
++            try {
++              await this.fff4Characteristic.subscribeAsync();
++              console.info('dji-device: Subscribed to characteristic fff4');
++              this.fff4Characteristic.on('data', (data: Buffer) => {
++                this.onCharacteristicValueChanged(this.fff4Characteristic!, data);
++              });
++              await new Promise((r) => setTimeout(r, 100));
++            } catch (subscribeError) {
++              console.error(
++                'dji-device: fff4 subscribe error',
++                subscribeError,
++              );
++            }
++          }
++          resolve();
++        },
++      );
++    });
++  }
++
++  private onCharacteristicValueChanged(
++    characteristic: Characteristic,
++    value: Buffer,
++  ): void {
++    // fff4 serves dual purpose: pairing trigger (non-DUML) and DUML data channel
++    if (characteristic.uuid === fff4Id) {
++      if (this.state === DjiDeviceState.connecting) {
++        // First data on fff4 while connecting — device is ready
++        // Set state to waitingForDevice; pairing request will be sent after
++        // discoverAndSubscribeCharacteristics finishes (see the code after that call)
++        console.info('dji-device: Device responded on fff4, waiting for pairing request');
++        this.setState(DjiDeviceState.waitingForDevice);
++        return;
++      }
++      // After pairing trigger, fff4 sends DUML messages — fall through to process them
+     }
+ 
+     if (!value?.length) {
+-      console.info('dji-device: Received empty message');
+       return;
+     }
+ 
+-    let message;
+-    try {
+-      message = new DjiMessageWithData(value);
++    // Select per-characteristic receive buffer
++    const isFff4 = characteristic.uuid === fff4Id;
++    let buf = isFff4 ? this.receiveBufferFff4 : this.receiveBufferFff5;
++
++    // Buffer incoming data — BLE messages may arrive fragmented across multiple notifications
++    buf = Buffer.concat([buf, value]);
++
++    // Try to parse complete messages from the buffer
++    while (buf.length >= 13) {
++      // Check for DUML magic byte
++      if (buf[0] !== 0x55) {
++        // Skip bytes until we find the magic byte
++        const magicIdx = buf.indexOf(0x55);
++        if (magicIdx === -1) {
++          buf = Buffer.alloc(0);
++          break;
++        }
++        buf = buf.subarray(magicIdx);
++        continue;
++      }
++
++      // Read message length from header
++      const msgLength = buf[1] | ((buf[2] & 0x03) << 8);
++      if (msgLength < 13) {
++        // Invalid length, skip this byte
++        buf = buf.subarray(1);
++        continue;
++      }
++
++      if (buf.length < msgLength) {
++        // Incomplete message, wait for more data
++        break;
++      }
++
++      // Extract complete message
++      const messageData = Buffer.from(buf.subarray(0, msgLength));
++      buf = buf.subarray(msgLength);
++
++      let message: DjiMessageWithData;
++      try {
++        message = new DjiMessageWithData(messageData);
++      } catch (error) {
++        // Log only first byte and length for debugging, silently skip invalid data
++        if (messageData[0] === 0x55) {
++          console.debug(`dji-device: Parse failed for ${messageData.toString('hex').substring(0, 30)}... (${error})`);
++        }
++        continue;
++      }
++
+       console.info(`dji-device: Received message ${message.format()}`);
+-    } catch (error) {
+-      console.error(
+-        `dji-device: Error parsing message from characteristic ${characteristic.uuid}`,
+-        error,
+-      );
+-      return;
++
++      this.processMessage(message);
+     }
+ 
+-    console.info(`dji-device: Got ${message.format()}`);
++    // Store updated buffer back
++    if (isFff4) {
++      this.receiveBufferFff4 = buf;
++    } else {
++      this.receiveBufferFff5 = buf;
++    }
++  }
++
++  private processMessage(message: DjiMessageWithData): void {
+     switch (this.state) {
++      case DjiDeviceState.waitingForDevice:
++        // Ignore DUML messages while waiting — pairing will start after fff4 write
++        break;
+       case DjiDeviceState.checkingIfPaired:
+         this.processCheckingIfPaired(message);
+         break;
+       case DjiDeviceState.pairing:
+-        this.processPairing();
+-        break;
+-      case DjiDeviceState.cleaningUp:
+-        this.processCleaningUp(message);
++        this.processPairing(message);
+         break;
+       case DjiDeviceState.preparingStream:
+         this.processPreparingStream(message);
+         break;
++      case DjiDeviceState.preparingStream2:
++        this.processPreparingStream2(message);
++        break;
+       case DjiDeviceState.settingUpWifi:
+         this.processSettingUpWifi(message);
+         break;
+@@ -382,6 +513,8 @@ export class DjiDevice {
+       case DjiDeviceState.stoppingStream:
+         this.processStoppingStream(message);
+         break;
++      case 0:
++        break;
+       default:
+         console.info(
+           `dji-device: Received message in unexpected state '${this.state}'`,
+@@ -389,9 +522,9 @@ export class DjiDevice {
+     }
+   }
+ 
+-  private sendStopStream(): void {
++  private async sendStopStream(): Promise<void> {
+     const payload = new DjiStopStreamingMessagePayload();
+-    this.writeMessage(
++    await this.writeMessage(
+       new DjiMessage(
+         stopStreamingTarget,
+         stopStreamingTransactionId,
+@@ -401,28 +534,42 @@ export class DjiDevice {
+     );
+   }
+ 
+-  private processCheckingIfPaired(response: DjiMessage): void {
+-    if (response.id !== pairTransactionId) {
++  private async processCheckingIfPaired(response: DjiMessage): Promise<void> {
++    // Response to SetPairingPIN: cmdSet=0x07, cmdId=0x45 with response flag
++    const flags = response.type & 0xff;
++    const cmdSet = (response.type >> 8) & 0xff;
++    const cmdId = (response.type >> 16) & 0xff;
++    if (cmdSet !== 0x07 || cmdId !== 0x45) {
+       return;
+     }
+-    if (response.payload.equals(Buffer.from([0, 1]))) {
+-      this.processPairing();
++    console.info(`dji-device: Pairing response: flags=0x${flags.toString(16)} payload=${response.payload.toString('hex')}`);
++    if (response.payload.length >= 2 && response.payload[1] === 0x01) {
++      // Already paired — go directly to preparing stream
++      console.info('dji-device: Device is already paired, preparing stream');
++      this.sendPrepareToLivestreamStage1();
+     } else {
++      // Not yet paired — wait for user to approve PIN on device
++      console.info('dji-device: Pairing required — approve PIN on device');
+       this.setState(DjiDeviceState.pairing);
+     }
+   }
+ 
+-  private processPairing(): void {
+-    this.sendStopStream();
+-    this.setState(DjiDeviceState.cleaningUp);
+-  }
+-
+-  private processCleaningUp(response: DjiMessage): void {
+-    if (response.id !== stopStreamingTransactionId) {
++  private async processPairing(response: DjiMessage): Promise<void> {
++    // Look for PairingPINApproved: cmdSet=0x07, cmdId=0x46
++    const cmdSet = (response.type >> 8) & 0xff;
++    const cmdId = (response.type >> 16) & 0xff;
++    if (cmdSet !== 0x07 || cmdId !== 0x46) {
+       return;
+     }
++    console.info(`dji-device: Pairing approved notification: payload=${response.payload.toString('hex')}`);
++    console.info('dji-device: Pairing approved, preparing stream');
++    this.sendPrepareToLivestreamStage1();
++  }
++
++  private async sendPrepareToLivestreamStage1(): Promise<void> {
++    console.info('dji-device: Sending PrepareToLiveStream Stage1');
+     const payload = new DjiPreparingToLivestreamMessagePayload();
+-    this.writeMessage(
++    await this.writeMessage(
+       new DjiMessage(
+         preparingToLivestreamTarget,
+         preparingToLivestreamTransactionId,
+@@ -433,19 +580,40 @@ export class DjiDevice {
+     this.setState(DjiDeviceState.preparingStream);
+   }
+ 
+-  private processPreparingStream(response: DjiMessage): void {
+-    if (
+-      response.id !== preparingToLivestreamTransactionId ||
+-      !this.wifiSsid ||
+-      !this.wifiPassword
+-    ) {
++  private async processPreparingStream(response: DjiMessage): Promise<void> {
++    // Accept response to PrepareToLiveStream (cmdSet=0x02, cmdId=0xE1) with response flag
++    if (!this.isResponseTo(response, preparingToLivestreamType)) {
+       return;
+     }
++    console.info(`dji-device: PrepareToLiveStream Stage1 response: payload=${response.payload.toString('hex')}`);
++    // Stage1 response received, send Stage2
++    console.info('dji-device: Sending PrepareToLiveStream Stage2');
++    await this.writeMessage(
++      new DjiMessage(
++        preparingToLivestreamTarget,
++        preparingToLivestreamStage2TransactionId,
++        startStopStreamingType,
++        Buffer.from([0x00, 0x01, 0x1c, 0x00]),
++      ),
++    );
++    this.setState(DjiDeviceState.preparingStream2);
++  }
++
++  private async processPreparingStream2(response: DjiMessage): Promise<void> {
++    if (!this.isResponseTo(response, startStopStreamingType)) {
++      return;
++    }
++    console.info(`dji-device: PrepareToLiveStream Stage2 response: payload=${response.payload.toString('hex')}`);
++    if (!this.wifiSsid || !this.wifiPassword) {
++      return;
++    }
++    // Stage2 response received, send WiFi setup
++    console.info(`dji-device: Sending WiFi credentials - SSID: ${this.wifiSsid}, Password: ${this.wifiPassword}`);
+     const payload = new DjiSetupWifiMessagePayload(
+       this.wifiSsid,
+       this.wifiPassword,
+     );
+-    this.writeMessage(
++    await this.writeMessage(
+       new DjiMessage(
+         setupWifiTarget,
+         setupWifiTransactionId,
+@@ -456,10 +624,11 @@ export class DjiDevice {
+     this.setState(DjiDeviceState.settingUpWifi);
+   }
+ 
+-  private processSettingUpWifi(response: DjiMessage): void {
+-    if (response.id !== setupWifiTransactionId || !this.model) {
++  private async processSettingUpWifi(response: DjiMessage): Promise<void> {
++    if (!this.isResponseTo(response, setupWifiType) || !this.model) {
+       return;
+     }
++    console.info(`dji-device: WiFi setup response: payload=${response.payload.toString('hex')}`);
+     switch (+this.model) {
+       case DjiDeviceModel.osmoAction3:
+         this.sendStartStreaming();
+@@ -473,7 +642,7 @@ export class DjiDevice {
+           this.imageStabilization,
+           false,
+         );
+-        this.writeMessage(
++        await this.writeMessage(
+           new DjiMessage(
+             configureTarget,
+             configureTransactionId,
+@@ -492,7 +661,7 @@ export class DjiDevice {
+           this.imageStabilization,
+           true,
+         );
+-        this.writeMessage(
++        await this.writeMessage(
+           new DjiMessage(
+             configureTarget,
+             configureTransactionId,
+@@ -512,17 +681,18 @@ export class DjiDevice {
+     }
+   }
+ 
+-  private processConfiguring(response: DjiMessage): void {
+-    if (response.id !== configureTransactionId) {
++  private async processConfiguring(response: DjiMessage): Promise<void> {
++    if (!this.isResponseTo(response, configureType)) {
+       return;
+     }
+     this.sendStartStreaming();
+   }
+ 
+-  private sendStartStreaming(): void {
++  private async sendStartStreaming(): Promise<void> {
+     if (!this.rtmpUrl || !this.resolution) {
+       return;
+     }
++    console.info(`dji-device: Sending RTMP config - URL: ${this.rtmpUrl}, Resolution: ${this.resolution}, FPS: ${this.fps}, Bitrate: ${this.bitrate / 1000}kbps`);
+     const payload = new DjiStartStreamingMessagePayload(
+       this.rtmpUrl,
+       this.resolution,
+@@ -530,7 +700,7 @@ export class DjiDevice {
+       this.bitrate / 1000,
+       this.model === DjiDeviceModel.osmoAction5Pro,
+     );
+-    this.writeMessage(
++    await this.writeMessage(
+       new DjiMessage(
+         startStreamingTarget,
+         startStreamingTransactionId,
+@@ -539,34 +709,31 @@ export class DjiDevice {
+       ),
+     );
+ 
+-    // Patch for OA5P: Send the confirmation payload to actually start the stream.
+-    // This is an exact copy of the stop-streaming command, but the last data-bit in the payload is set to 1 instead of 2.
+-    // It may probably work fine sending it on all devices, but limiting it to OA5P for now.
+-    if (this.model === DjiDeviceModel.osmoAction5Pro) {
+-      const confirmStartStreamPayload =
+-        new DjiConfirmStartStreamingMessagePayload();
+-      this.writeMessage(
+-        new DjiMessage(
+-          stopStreamingTarget,
+-          stopStreamingTransactionId,
+-          stopStreamingType,
+-          confirmStartStreamPayload.encode(),
+-        ),
+-      );
+-    }
++    // Send the StartStopStreaming confirmation to actually begin the stream
++    // djictl sends this for ALL devices, not just OA5P
++    const confirmStartStreamPayload =
++      new DjiConfirmStartStreamingMessagePayload();
++    await this.writeMessage(
++      new DjiMessage(
++        stopStreamingTarget,
++        confirmStartStreamingTransactionId,
++        stopStreamingType,
++        confirmStartStreamPayload.encode(),
++      ),
++    );
+ 
+     this.setState(DjiDeviceState.startingStream);
+   }
+ 
+-  private processStartingStream(response: DjiMessage): void {
+-    if (response.id !== startStreamingTransactionId) {
++  private async processStartingStream(response: DjiMessage): Promise<void> {
++    if (!this.isResponseTo(response, startStreamingType) && !this.isResponseTo(response, stopStreamingType)) {
+       return;
+     }
+     this.setState(DjiDeviceState.streaming);
+     this.stopStartStreamingTimer();
+   }
+ 
+-  private processStreaming(response: DjiMessage): void {
++  private async processStreaming(response: DjiMessage): Promise<void> {
+     switch (response.type) {
+       case 0x020d00:
+         if (response.payload.length >= 21) {
+@@ -578,24 +745,38 @@ export class DjiDevice {
+     }
+   }
+ 
+-  private processStoppingStream(response: DjiMessage): void {
++  private async processStoppingStream(response: DjiMessage): Promise<void> {
+     if (response.id !== stopStreamingTransactionId) {
+-      return;
++      // return;
+     }
+     this.reset();
+   }
+ 
+-  private writeMessage(message: DjiMessage): void {
+-    this.writeValue(message.encode());
++  // Check if a received message is a response to a command type we sent
++  // Device may respond with response flag (0x80) set, or as unsolicited notification (flags=0x02)
++  private isResponseTo(response: DjiMessage, sentType: number): boolean {
++    const sentCmdSet = (sentType >> 8) & 0xff;
++    const sentCmdId = (sentType >> 16) & 0xff;
++    const respFlags = response.type & 0xff;
++    const respCmdSet = (response.type >> 8) & 0xff;
++    const respCmdId = (response.type >> 16) & 0xff;
++    // Match by cmdSet + cmdId with response flag, OR exact cmdSet + cmdId
++    return respCmdSet === sentCmdSet && (respCmdId === sentCmdId || (respFlags & 0x80) !== 0 && respCmdId === sentCmdId);
++  }
++
++  private async writeMessage(message: DjiMessage): Promise<void> {
++    const encoded = message.encode();
++    console.debug(`dji-device: TX [${encoded.toString('hex')}]`);
++    await this.writeValue(encoded);
+   }
+ 
+   private async writeValue(value: Buffer): Promise<void> {
+-    if (!this.fff3Characteristic) {
+-      console.error('dji-device: No characteristic to write to');
++    if (!this.fff5Characteristic) {
++      console.error('dji-device: No fff5 characteristic to write to');
+       return;
+     }
+-    await this.fff3Characteristic
+-      .writeAsync(value, false)
++    await this.fff5Characteristic
++      .writeAsync(value, true)
+       .then(() => {
+         console.debug('dji-device: Write successful');
+       })
+diff --git a/src/message.ts b/src/message.ts
+index 11292fd..371ac20 100644
+--- a/src/message.ts
++++ b/src/message.ts
+@@ -52,7 +52,7 @@ export class DjiMessage {
+     const body = Buffer.concat([
+       headerWithCrc,
+       Buffer.from([this.target & 0xff, (this.target >> 8) & 0xff]),
+-      Buffer.from([this.id & 0xff, (this.id >> 8) & 0xff]),
++      Buffer.from([(this.id >> 8) & 0xff, this.id & 0xff]),
+       Buffer.from([
+         this.type & 0xff,
+         (this.type >> 8) & 0xff,
+@@ -94,7 +94,7 @@ export class DjiMessageWithData extends DjiMessage {
+       );
+     }
+     const target = reader.readUint16(true); // LE
+-    const id = reader.readUint16(true); // LE
++    const id = reader.readUint16(false); // BE — djictl writes MessageID as BE
+     const type = reader.readUint24(true); // LE
+     const payload = reader.readBytes(reader.bytesRemaining - 2);
+     const crc = reader.readUint16(true); // LE
+@@ -109,11 +109,8 @@ export class DjiMessageWithData extends DjiMessage {
+ }
+ 
+ export class DjiPairMessagePayload {
+-  static payload = Buffer.from([
+-    0x20, 0x32, 0x38, 0x34, 0x61, 0x65, 0x35, 0x62, 0x38, 0x64, 0x37, 0x36,
+-    0x62, 0x33, 0x33, 0x37, 0x35, 0x61, 0x30, 0x34, 0x61, 0x36, 0x34, 0x31,
+-    0x37, 0x61, 0x64, 0x37, 0x31, 0x62, 0x65, 0x61, 0x33,
+-  ]);
++  // App identifier string — matches djictl's default
++  static appIdentifier = '001749319286102';
+   pairPinCode: string;
+ 
+   constructor(pairPinCode: string) {
+@@ -121,9 +118,9 @@ export class DjiPairMessagePayload {
+   }
+ 
+   encode(): Buffer {
+-    const payload = DjiPairMessagePayload.payload;
++    const identifierBuffer = djiPackString(DjiPairMessagePayload.appIdentifier);
+     const pinCodeBuffer = djiPackString(this.pairPinCode);
+-    return Buffer.concat([payload, pinCodeBuffer]);
++    return Buffer.concat([identifierBuffer, pinCodeBuffer]);
+   }
+ }
+ 
