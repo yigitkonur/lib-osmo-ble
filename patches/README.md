@@ -30,14 +30,18 @@ git clone https://github.com/datagutt/node-osmo
 cd node-osmo
 
 # Apply the patch
-git apply path/to/node-osmo-all-fixes.patch
+git am path/to/node-osmo-all-fixes.patch
 
 # Install dependencies and build
 pnpm install
-npx tsc
+npx tsc && cp src/cli.mjs dist/cli.mjs
+
+# Install CLI globally
+pnpm link --global
 
 # Test
-node examples/connect-to-device.js <device-id> 3 <wifi-ssid> <wifi-password> '<rtmp-url>'
+dji-osmo scan
+dji-osmo stream <device-id> --ssid <wifi-ssid> --password <wifi-password> --rtmp '<rtmp-url>'
 ```
 
 ### Files Changed
