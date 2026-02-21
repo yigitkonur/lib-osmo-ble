@@ -44,7 +44,8 @@ setTimeout(() => {
     console.log(`Found ${found.size} DJI device(s).`);
     console.log('\nTo connect:');
     for (const [id, info] of found) {
-      console.log(`  node examples/connect-to-device.js ${id} 3 <wifi-ssid> <wifi-pass> <rtmp-url>`);
+      console.log(`  dji-osmo gimbal ${id}`);
+      console.log(`  dji-osmo gimbal ${id} --pin <pin> --recenter`);
     }
   }
   process.exit(0);

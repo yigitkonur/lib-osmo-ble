@@ -341,8 +341,11 @@ Used for string fields (SSID, password, PIN, identifier):
 
 ### Build & Run
 ```bash
-npx tsc                    # Build TypeScript
-node examples/connect-to-device.js <deviceId> <model> <ssid> <password> <rtmpUrl>
+# No build step required — pure ES module JavaScript
+npm install
+dji-osmo gimbal <deviceId>               # Interactive gimbal control
+dji-osmo gimbal <deviceId> --recenter    # One-shot: recenter gimbal
+node tools/scan-device.mjs               # Scan for DJI BLE devices
 ```
 
 ### BLE Utilities
