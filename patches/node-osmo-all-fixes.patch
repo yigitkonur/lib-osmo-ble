@@ -715,7 +715,7 @@ index 0000000..f7c6baa
 +│                                                                            │
 +│  Documentation:                                                            │
 +│    • Protocol spec: PROTOCOL.md in repository                              │
-+│    • GitHub: github.com/yigitkonur/dji-osmo-ble-protocol                   │
++│    • GitHub: github.com/yigitkonur/lib-osmo-ble                            │
 +│                                                                            │
 +│  Tools:                                                                    │
 +│    • FFmpeg: ffmpeg.org                                                    │
@@ -724,7 +724,7 @@ index 0000000..f7c6baa
 +└────────────────────────────────────────────────────────────────────────────┘
 +
 +  For more help: dji-osmo <command> --help
-+  Report issues: github.com/yigitkonur/dji-osmo-ble-protocol/issues
++  Report issues: github.com/yigitkonur/lib-osmo-ble/issues
 +
 +`;
 +

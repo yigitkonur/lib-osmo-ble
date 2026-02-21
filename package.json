@@ -1,5 +1,5 @@
 {
-  "name": "dji-osmo-ble-protocol",
+  "name": "lib-osmo-ble",
   "version": "1.0.0",
   "description": "DJI Osmo Pocket 3 BLE protocol library — DUML messaging, pairing, and gimbal control",
   "main": "src/connection.mjs",
@@ -18,16 +18,16 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/yigitkonur/dji-osmo-ble-protocol.git"
+    "url": "git+https://github.com/yigitkonur/lib-osmo-ble.git"
   },
   "keywords": [],
   "author": "",
   "license": "ISC",
   "type": "module",
   "bugs": {
-    "url": "https://github.com/yigitkonur/dji-osmo-ble-protocol/issues"
+    "url": "https://github.com/yigitkonur/lib-osmo-ble/issues"
   },
-  "homepage": "https://github.com/yigitkonur/dji-osmo-ble-protocol#readme",
+  "homepage": "https://github.com/yigitkonur/lib-osmo-ble#readme",
   "dependencies": {
     "@stoprocent/noble": "^2.3.10",
     "crc-full": "^1.1.0"
