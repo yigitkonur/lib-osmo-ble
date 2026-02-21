@@ -1,240 +1,195 @@
-# DJI Osmo Pocket 3 — BLE Reverse Engineering & RTMP Streaming
-
-> **Successfully achieved**: Full BLE pairing → WiFi configuration → RTMP livestream initiation on a DJI Osmo Pocket 3, entirely from the command line on macOS, without the DJI Mimo app.
-
-## What This Is
-
-A complete documentation of reverse engineering the DJI Osmo Pocket 3's Bluetooth Low Energy (BLE) protocol to enable programmatic control — specifically, triggering RTMP livestreaming from a Node.js application. This repository contains:
-
-- **[PROTOCOL.md](PROTOCOL.md)** — Complete DUML-over-BLE protocol specification
-- **[JOURNEY.md](JOURNEY.md)** — The full reverse engineering narrative with every wrong turn and breakthrough
-- **[patches/](patches/)** — Working patches for the [node-osmo](https://github.com/datagutt/node-osmo) library
-- **[experiments/](experiments/)** — Annotated debug logs from 14 iterative experiments
-- **[analysis/](analysis/)** — Deep-dive analysis of each bug discovered
-- **[reference/](reference/)** — Wireshark dissector and protocol notes from [xaionaro's research](https://github.com/xaionaro/reverse-engineering-dji)
-
-## The Result
-
-```
-State change 0 -> 1    idle → discovering
-State change 1 -> 2    → connecting
-State change 2 -> 3    → waitingForDevice
-State change 3 -> 4    → checkingIfPaired (sent PIN)
-  ← Pairing response: payload=0002 (pairing required)
-State change 4 -> 5    → pairing
-  ← Pairing approved: payload=01
-State change 5 -> 6    → preparingStream (Stage 1 OK)
-State change 6 -> 7    → preparingStream2 (Stage 2 OK)
-State change 7 -> 8    → settingUpWifi (WiFi connected)
-State change 8 -> 10   → startingStream
-State change 10 -> 11  → streaming ✅
-```
-
-The camera connects to a local WiFi network and pushes an RTMP stream to a specified server — all triggered over BLE from a single command:
+reverse-engineered BLE protocol for the DJI Osmo Pocket 3. full DUML message implementation, pairing flow, gimbal control, and live telemetry — all from Node.js over Bluetooth, no DJI Mimo app needed.
 
 ```bash
-node examples/connect-to-device.js <deviceId> 3 <ssid> <password> 'rtmp://server:port/live/key'
+dji-osmo gimbal <device-id>
 ```
 
-## Quick Start
+[![node](https://img.shields.io/badge/node.js-ESM-93450a.svg?style=flat-square)](https://nodejs.org/)
+[![license](https://img.shields.io/badge/license-MIT-grey.svg?style=flat-square)](https://opensource.org/licenses/MIT)
+
+---
+
+## what it does
+
+talks directly to the Osmo Pocket 3 over BLE using DJI's proprietary DUML binary protocol. built by capturing and decoding Wireshark traces of the DJI Mimo app.
+
+- **full DUML protocol** — message builder, parser, stream reassembly, CRC8/CRC16 engine
+- **BLE transport** — scan, connect, pair, subscribe to notifications on `fff0` service
+- **gimbal control** — 5 command methods: velocity, absolute angle, timed angle, incremental move, raw PWM
+- **live telemetry** — pitch/roll/yaw position at ~20 Hz via push notifications
+- **interactive CLI** — keyboard-driven gimbal control with live status line
+- **diagnostic tools** — BLE scanner, characteristic inspector, DUML message decoder/CRC verifier
+
+> **note:** gimbal motor commands are sent and parsed correctly, but the Osmo Pocket 3 silently ignores them over BLE alone. likely requires active WiFi streaming first. gimbal telemetry works fine.
+
+## install
 
 ```bash
-# Clone and patch node-osmo
-git clone https://github.com/datagutt/node-osmo
+git clone https://github.com/yigitkonur/dji-osmo-ble-protocol.git
+cd dji-osmo-ble-protocol
+npm install
+```
+
+two runtime deps: `@stoprocent/noble` (BLE) and `crc-full` (CRC). no build step.
+
+for global CLI access:
+
+```bash
+npm link
+```
+
+## usage
+
+### scan for devices
+
+```bash
+node tools/scan-device.mjs [timeout_seconds]
+```
+
+prints device name, peripheral ID, RSSI, manufacturer data, and service UUIDs for all DJI devices found.
+
+### interactive gimbal control
+
+```bash
+dji-osmo gimbal <device-id>
+```
+
+| key | action |
+|:---|:---|
+| arrows / WASD | pitch and yaw |
+| E / C | roll left / right |
+| R | recenter (0,0,0) |
+| +/- | adjust speed (1..180 deg/s) |
+| 1-5 | switch command method (speed/angle/abs/PWM/move) |
+| Q | disconnect and exit |
+
+live status line updates every 500 ms with current gimbal position, speed, active method, and command count.
+
+### one-shot commands
+
+```bash
+dji-osmo gimbal <device-id> --recenter
+dji-osmo gimbal <device-id> --mode follow
+dji-osmo gimbal <device-id> --angle -30 90    # pitch=-30, yaw=90
+```
+
+### diagnostic tools
+
+```bash
+# inspect BLE characteristics
+node tools/check-characteristics.mjs <device-id>
+
+# decode and CRC-verify a DUML hex message
+node tools/verify-crc.mjs 552204ea020780924007450f30303137343933313932383631303204353136302e42
+```
+
+### as a library
+
+```javascript
+import { OsmoConnection } from 'dji-osmo-ble-protocol';
+
+const conn = new OsmoConnection({ deviceId: '<id>', pin: 'love' });
+await conn.connect();
+await conn.pair();
+
+conn.gimbal.on('state', ({ pitch, roll, yaw }) => {
+  console.log(`pitch=${pitch} roll=${roll} yaw=${yaw}`);
+});
+
+conn.gimbal.setSpeed(10, 0, 0);  // pitch at 10 deg/s
+```
+
+modular exports available:
+
+```javascript
+import { buildMessage, parseMessage } from 'dji-osmo-ble-protocol/protocol';
+import { BleTransport } from 'dji-osmo-ble-protocol/transport';
+import { GimbalController } from 'dji-osmo-ble-protocol/gimbal';
+```
+
+## CLI flags
+
+| flag | default | description |
+|:---|:---|:---|
+| `--pin <pin>` | `love` | BLE pairing PIN |
+| `--angle <pitch> <yaw>` | — | set absolute angle, then disconnect |
+| `--recenter` | — | recenter to 0,0,0, then disconnect |
+| `--mode <mode>` | — | set mode (`follow`, `lock`, `fpv`), then disconnect |
+
+## protocol overview
+
+DUML (DJI Universal Markup Language) is a binary framing protocol:
+
+```
+[0x55] [length:10bit] [version:6bit] [CRC8] [target:16LE] [seq:16BE] [flags] [cmdSet] [cmdId] [payload...] [CRC16:LE]
+```
+
+- CRC8: poly=0x31, init=0xEE, reflected — over first 3 bytes
+- CRC16: poly=0x1021, init=0x496C, reflected — over full frame minus trailer
+- target field: `sender | (receiver << 8)` in little-endian
+- message ID: big-endian (only BE field in the frame)
+
+### BLE characteristics
+
+| char | properties | role |
+|:---|:---|:---|
+| `fff4` | read, write, notify, indicate | pairing trigger + inbound DUML notifications |
+| `fff5` | read, writeWithoutResponse, notify, indicate | outbound DUML commands |
+
+critical discovery: `fff3` has `write` (with response) and accepts writes without error, but the firmware silently ignores the payload. only `fff5` (`writeWithoutResponse`) actually processes DUML. this created a silent failure mode in the existing `node-osmo` library.
+
+### implemented commands
+
+| cmd set | cmd ID | description |
+|:---|:---|:---|
+| 0x04 (gimbal) | 0x01 | raw PWM (363..1685, center=1024) |
+| 0x04 | 0x05 | position telemetry (push, ~20 Hz) |
+| 0x04 | 0x0A | absolute angle |
+| 0x04 | 0x0C | velocity control |
+| 0x04 | 0x14 | absolute angle with duration |
+| 0x04 | 0x15 | incremental move (±127 steps) |
+| 0x04 | 0x4C | set mode (lock/follow/FPV) |
+| 0x07 (wifi) | 0x45 | set pairing PIN |
+| 0x07 | 0x46 | pairing approved |
+| 0x07 | 0x47 | WiFi connect |
+
+full protocol spec in [PROTOCOL.md](PROTOCOL.md).
+
+## node-osmo patch
+
+includes a `git format-patch` fixing 7 bugs in the [datagutt/node-osmo](https://github.com/datagutt/node-osmo) library:
+
+```bash
 cd node-osmo
-git apply ../dji-osmo-ble-protocol/patches/node-osmo-all-fixes.patch
-pnpm install
-npx tsc && cp src/cli.mjs dist/cli.mjs
-
-# Install CLI globally
-pnpm link --global
-
-# Scan for your device
-dji-osmo scan
-
-# Get device info (battery, telemetry)
-dji-osmo info <device-id>
-
-# Start RTMP livestream
-dji-osmo stream <device-id> --ssid MyWiFi --password secret --rtmp rtmp://server/live/key
+git am ../dji-osmo-ble-protocol/patches/node-osmo-all-fixes.patch
 ```
 
-## CLI
+the biggest bug: `ByteBuf extends DataView` initialized `#byteOffset` to the Node.js Buffer pool offset (~4096) instead of 0, causing every byte read to hit the wrong position. all messages decoded to type `1794` (0x0702). details in `analysis/bytebuf-node-buffer-pool.md`.
 
-The `dji-osmo` CLI provides four commands:
-
-```
-dji-osmo scan                   Scan for nearby DJI Osmo devices
-dji-osmo stream <id> [opts]     Start RTMP livestreaming
-dji-osmo pair <id>              Pair with a device
-dji-osmo info <id>              Show device telemetry (battery %, IMU, etc.)
-```
-
-### Example Session
+## project structure
 
 ```
-$ dji-osmo scan
-ℹ Scanning for DJI Osmo devices (10s)...
-
-  OsmoPocket3-7B4B
-    ID:    446005f4812a14933a2a9960c0acf1f4
-    RSSI:  -45 dBm
-
-✓ Found 1 device(s). Use the ID with other commands.
-
-$ dji-osmo info 446005f4812a14933a2a9960c0acf1f4
-  Device Information
-  Name:     OsmoPocket3-7B4B
-  Battery:  32%
-  ...
-
-$ dji-osmo stream 446005f4812a14933a2a9960c0acf1f4 -s Zeo -p mypass -r rtmp://server/live/key
-ℹ Connecting to device...
-ℹ State: discovering → connecting → pairing → streaming
-
-✓ 🎥 STREAMING LIVE → rtmp://server/live/key
+src/
+  connection.mjs           — top-level facade (scan, connect, pair)
+  transport/
+    ble.mjs                — noble-based BLE layer
+  protocol/
+    constants.mjs          — addresses, UUIDs, CRCs, command IDs
+    duml.mjs               — DUML builder, parser, stream reassembly
+  controllers/
+    gimbal.mjs             — gimbal API (5 command methods + telemetry)
+  cli/
+    index.mjs              — CLI entry point
+    cmd-gimbal.mjs         — interactive keyboard mode
+tools/
+  scan-device.mjs          — BLE scanner
+  check-characteristics.mjs — characteristic inspector
+  verify-crc.mjs           — DUML message decoder + CRC verifier
+analysis/                  — research notes (BLE mapping, endianness, bugs)
+reference/                 — Wireshark dissector source, annotated captures
+patches/                   — node-osmo bug fixes (git format-patch)
 ```
 
-## The 7 Bugs That Prevented Everything
+## license
 
-The journey to a working connection required finding and fixing **7 independent bugs**, any one of which silently prevented the protocol from working:
-
-### Bug #1: ByteBuf Pool Offset (Root Cause of All Parse Failures)
-Node.js `Buffer.alloc()` uses a shared 8KB memory pool. `ByteBuf` initialized its internal `#byteOffset` to `super.byteOffset` (e.g., 4096) instead of `0`, causing every single byte read to happen at the wrong position.
-
-### Bug #2: ByteBuf DataView Length
-`ByteBuf.from()` created a `DataView` without passing the source's `byteLength`, so it spanned the entire 8KB pool instead of just the message bytes.
-
-### Bug #3: ByteBuf getUint24() Raw Array Access
-`getUint24()` accessed the raw `Uint8Array(this.buffer)` without adding `super.byteOffset`, reading bytes from the pool start instead of the message.
-
-### Bug #4: Message ID Byte Order
-Message IDs were encoded as Little Endian but the wire format is **Big Endian** (confirmed by Wireshark captures from the DJI Mimo app).
-
-### Bug #5: Wrong BLE Characteristic for Writes ⭐
-**The single most critical discovery.** DUML commands were being written to characteristic **fff3** (which has `write` property). But the DJI Mimo app writes to **fff5** (which has `writeWithoutResponse`). The device silently ignores DUML commands on fff3.
-
-### Bug #6: Fire-and-Forget BLE Writes
-`writeMessage()` was synchronous and didn't `await` the async BLE write. Writes appeared to send (TX logged) but the BLE stack may not have delivered them.
-
-### Bug #7: manufacturerData Discovery Guard
-`onDiscover()` required `manufacturerData` in the BLE advertisement, but the Osmo Pocket 3 doesn't include it. The device was found by noble but silently filtered out.
-
-## Architecture
-
-```
-┌──────────────────────────────────────────────────────────┐
-│                    macOS / Node.js                        │
-│                                                          │
-│  ┌─────────────┐    ┌──────────────┐    ┌────────────┐  │
-│  │ noble (BLE)  │───▶│  node-osmo   │───▶│  DUML Msg  │  │
-│  │ @stoprocent  │    │  device.ts   │    │  message.ts│  │
-│  └──────┬───────┘    └──────────────┘    └────────────┘  │
-│         │                                                │
-│    ┌────▼────────────────────────────────────────┐       │
-│    │           BLE GATT Service fff0             │       │
-│    │                                             │       │
-│    │  fff3: read/write (NOT used for DUML)       │       │
-│    │  fff4: read/write/notify                    │       │
-│    │    ├─ Write [0x01,0x00] → trigger pairing   │       │
-│    │    └─ Receives ALL DUML notifications       │       │
-│    │  fff5: writeWithoutResponse/notify           │       │
-│    │    └─ Write DUML commands HERE ⭐            │       │
-│    └────────────────────────────────────────────┘       │
-└──────────────────────────────────────────────────────────┘
-                          │ BLE
-                          ▼
-┌──────────────────────────────────────────────────────────┐
-│              DJI Osmo Pocket 3                           │
-│                                                          │
-│  ┌──────────┐  ┌──────────┐  ┌──────────┐              │
-│  │  WiFi    │  │ Streaming│  │  Gimbal   │              │
-│  │ cmdSet07 │  │ cmdSet02 │  │ cmdSet04  │              │
-│  └────┬─────┘  └────┬─────┘  └──────────┘              │
-│       │              │                                   │
-│       │    ┌─────────▼──────────┐                       │
-│       └───▶│   RTMP Encoder     │                       │
-│            └─────────┬──────────┘                       │
-│                      │ WiFi                              │
-└──────────────────────┼──────────────────────────────────┘
-                       ▼
-              ┌────────────────┐
-              │  RTMP Server   │
-              │  (your server) │
-              └────────────────┘
-```
-
-## DUML Message Format
-
-```
-[0x55] [len_lo] [ver<<2|len_hi] [crc8] [target:2B LE] [id:2B BE] [type:3B] [payload] [crc16:2B LE]
-```
-
-See [PROTOCOL.md](PROTOCOL.md) for the complete specification.
-
-## Project Structure
-
-```
-dji-osmo-ble-protocol/
-├── README.md                          # This file
-├── PROTOCOL.md                        # Complete protocol specification
-├── JOURNEY.md                         # Reverse engineering narrative
-├── patches/
-│   ├── node-osmo-all-fixes.patch      # All 7 bug fixes for node-osmo
-│   └── README.md                      # Patch application instructions
-├── experiments/
-│   ├── README.md                      # Experiment index
-│   └── logs/
-│       ├── 01-initial-bytebuf-fix.log
-│       ├── 04-false-positive-all-telemetry.log
-│       ├── 07-restructured-pairing.log
-│       ├── 12-manufacturer-data-fix.log
-│       ├── 13-async-write-fix.log
-│       └── 14-success-full-streaming.log
-├── analysis/
-│   ├── bytebuf-node-buffer-pool.md    # Deep dive: Node.js Buffer pool vs DataView
-│   ├── ble-characteristic-mapping.md  # Which char does what
-│   ├── message-endianness.md          # BE vs LE analysis
-│   ├── false-positive-analysis.md     # Why run #4 appeared to work but didn't
-│   └── pairing-flow-comparison.md     # node-osmo vs djictl vs DJI Mimo
-├── reference/
-│   ├── xaionaro-message-types.md      # From xaionaro/reverse-engineering-dji
-│   └── dji-ble-message.c             # Wireshark dissector source
-└── tools/
-    ├── scan-device.mjs                # BLE scanner for DJI devices
-    ├── check-characteristics.mjs      # Dump BLE service/char properties
-    └── verify-crc.mjs                 # CRC8/CRC16 verification tool
-```
-
-## Device Compatibility
-
-| Device | Model ID | Status |
-|--------|----------|--------|
-| DJI Osmo Pocket 3 | 3 | ✅ Verified — full pairing + streaming |
-| DJI Osmo Mobile | — | Untested (likely compatible) |
-| DJI Osmo Action | — | Untested |
-
-## Requirements
-
-- **macOS** with Bluetooth (tested on Apple Silicon / Sequoia)
-- **Node.js** v18+ (tested on v25.5.0)
-- **pnpm** package manager
-- `@stoprocent/noble` (NOT `@abandonware/noble`)
-- `blueutil` (for Bluetooth reset: `brew install blueutil`)
-- An RTMP server (e.g., [MediaMTX](https://github.com/bluenviron/mediamtx), nginx-rtmp)
-
-## Known Issues
-
-- **Rapid reconnections can crash camera's BLE stack** — the camera stops advertising and needs a power cycle. Always disconnect cleanly.
-- **macOS CoreBluetooth state** — if the camera disappears from scans, run `blueutil --power 0 && sleep 2 && blueutil --power 1`
-- **PIN code** — the default is `5160` but may vary. Check the camera's screen during pairing.
-
-## Acknowledgments
-
-- [xaionaro/reverse-engineering-dji](https://github.com/xaionaro/reverse-engineering-dji) — Wireshark captures and dissector that provided the critical clue about fff5 being the write characteristic
-- [datagutt/node-osmo](https://github.com/datagutt/node-osmo) — Original Node.js library that provided the foundation
-- [djictl](https://github.com/xaionaro/djictl) — Go reference implementation of the DUML protocol
-
-## License
-
-This research is published for educational purposes. The protocol documentation is original reverse engineering work. See individual files for their respective licenses.
+MIT
